@@ -1,6 +1,15 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
 import { auth, googleAuthProvider } from '../lib/firebase.ts';
+import { isSupabaseClientConfigured, supabase } from '../lib/supabase.ts';
 import { apiRequest } from '../lib/api.ts';
 import type {
   CartLine,
@@ -23,6 +32,12 @@ export type AppRoute =
   | { page: 'account' }
   | { page: 'dispatch' }
   | { page: 'admin' };
+
+export interface AuthSessionUser {
+  uid: string;
+  email: string | null;
+  displayName: string | null;
+}
 
 interface ToastItem {
   id: number;
@@ -51,11 +66,15 @@ interface StoreContextValue {
   clearCart: () => void;
   cartCount: number;
   cartSubtotalNgn: number;
-  firebaseUser: User | null;
+  authProvider: 'supabase' | 'firebase';
+  firebaseUser: AuthSessionUser | null;
   dbUser: DbUser | null;
   authReady: boolean;
   getIdToken: () => Promise<string | null>;
   signInWithGoogle: () => Promise<void>;
+  signInWithEmail: (email: string, password: string) => Promise<boolean>;
+  signUpWithEmail: (email: string, password: string, fullName?: string) => Promise<boolean>;
+  sendPasswordReset: (email: string) => Promise<boolean>;
   signOutUser: () => Promise<void>;
   refreshDbUser: () => Promise<void>;
   notify: (text: string, tone?: 'ok' | 'error' | 'info') => void;
@@ -127,6 +146,8 @@ function routeToHash(r: AppRoute): string {
 }
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
+  const authProvider: 'supabase' | 'firebase' = isSupabaseClientConfigured ? 'supabase' : 'firebase';
+
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     return saved === 'light' ? 'light' : 'dark';
@@ -150,7 +171,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   });
   const [bagOpen, setBagOpen] = useState(false);
 
-  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<AuthSessionUser | null>(null);
   const [dbUser, setDbUser] = useState<DbUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -225,13 +246,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     void refreshCatalog();
   }, [refreshCatalog]);
 
-  const syncUserProfile = useCallback(async (user: User | null) => {
-    if (!user) {
+  const syncWithToken = useCallback(async (token: string | null) => {
+    if (!token) {
       setDbUser(null);
       return;
     }
     try {
-      const token = await user.getIdToken();
       const res = await apiRequest<{ user: DbUser }>('/api/auth/me', { token });
       setDbUser(res.user);
     } catch {
@@ -240,41 +260,251 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (authProvider === 'supabase' && supabase) {
+      let mounted = true;
+      void supabase.auth.getSession().then(async ({ data }) => {
+        if (!mounted) return;
+        const session = data.session;
+        if (session?.user) {
+          const meta = (session.user.user_metadata || {}) as Record<string, unknown>;
+          setFirebaseUser({
+            uid: session.user.id,
+            email: session.user.email || null,
+            displayName:
+              (typeof meta.full_name === 'string' && meta.full_name) ||
+              (typeof meta.name === 'string' && meta.name) ||
+              null,
+          });
+          await syncWithToken(session.access_token);
+        } else {
+          setFirebaseUser(null);
+          setDbUser(null);
+        }
+        if (mounted) setAuthReady(true);
+      });
+
+      const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
+        if (!mounted) return;
+        if (session?.user) {
+          const meta = (session.user.user_metadata || {}) as Record<string, unknown>;
+          setFirebaseUser({
+            uid: session.user.id,
+            email: session.user.email || null,
+            displayName:
+              (typeof meta.full_name === 'string' && meta.full_name) ||
+              (typeof meta.name === 'string' && meta.name) ||
+              null,
+          });
+          await syncWithToken(session.access_token);
+        } else {
+          setFirebaseUser(null);
+          setDbUser(null);
+        }
+        if (mounted) setAuthReady(true);
+      });
+
+      return () => {
+        mounted = false;
+        listener.subscription.unsubscribe();
+      };
+    }
+
     const unsub = onAuthStateChanged(auth, async (user) => {
-      setFirebaseUser(user);
-      await syncUserProfile(user);
+      if (user) {
+        setFirebaseUser({
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName,
+        });
+        const token = await user.getIdToken();
+        await syncWithToken(token);
+      } else {
+        setFirebaseUser(null);
+        setDbUser(null);
+      }
       setAuthReady(true);
     });
     return () => unsub();
-  }, [syncUserProfile]);
+  }, [authProvider, syncWithToken]);
 
   const getIdToken = useCallback(async () => {
+    if (authProvider === 'supabase' && supabase) {
+      const { data } = await supabase.auth.getSession();
+      return data.session?.access_token || null;
+    }
     if (!auth.currentUser) return null;
     return auth.currentUser.getIdToken();
-  }, []);
+  }, [authProvider]);
 
   const signInWithGoogle = useCallback(async () => {
+    if (authProvider === 'supabase' && supabase) {
+      try {
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: `${window.location.origin}/#/account`,
+          },
+        });
+        if (error) throw error;
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Google sign-in could not start.', 'error');
+      }
+      return;
+    }
+
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
-      await syncUserProfile(cred.user);
+      const token = await cred.user.getIdToken();
+      await syncWithToken(token);
       notify(`Welcome back, ${cred.user.displayName || cred.user.email || 'Crown'}`, 'ok');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Google sign-in cancelled.', 'error');
     }
-  }, [notify, syncUserProfile]);
+  }, [authProvider, notify, syncWithToken]);
+
+  const signInWithEmail = useCallback(
+    async (email: string, password: string): Promise<boolean> => {
+      const cleanEmail = email.trim().toLowerCase();
+      if (authProvider === 'supabase' && supabase) {
+        try {
+          const { data, error } = await supabase.auth.signInWithPassword({
+            email: cleanEmail,
+            password,
+          });
+          if (error) throw error;
+          if (data.session?.access_token) {
+            await syncWithToken(data.session.access_token);
+          }
+          notify(`Welcome back, ${data.user?.email || 'Crown'}`, 'ok');
+          return true;
+        } catch (err) {
+          notify(err instanceof Error ? err.message : 'Invalid email or password.', 'error');
+          return false;
+        }
+      }
+
+      try {
+        const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+        const token = await cred.user.getIdToken();
+        await syncWithToken(token);
+        notify(`Welcome back, ${cred.user.displayName || cred.user.email || 'Crown'}`, 'ok');
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Invalid email or password.';
+        if (msg.includes('operation-not-allowed')) {
+          notify(
+            'Enable Email/Password sign-in in Firebase Console (Authentication → Sign-in method) or configure Supabase Auth.',
+            'error',
+          );
+        } else {
+          notify(msg, 'error');
+        }
+        return false;
+      }
+    },
+    [authProvider, notify, syncWithToken],
+  );
+
+  const signUpWithEmail = useCallback(
+    async (email: string, password: string, fullName?: string): Promise<boolean> => {
+      const cleanEmail = email.trim().toLowerCase();
+      if (password.length < 8) {
+        notify('Use a password of at least 8 characters.', 'error');
+        return false;
+      }
+      if (authProvider === 'supabase' && supabase) {
+        try {
+          const { data, error } = await supabase.auth.signUp({
+            email: cleanEmail,
+            password,
+            options: {
+              data: fullName?.trim() ? { full_name: fullName.trim() } : undefined,
+              emailRedirectTo: `${window.location.origin}/#/account`,
+            },
+          });
+          if (error) throw error;
+          if (data.session?.access_token) {
+            await syncWithToken(data.session.access_token);
+            notify('Account created and signed in.', 'ok');
+          } else {
+            notify('Check your email to confirm your account, then sign in.', 'info');
+          }
+          return true;
+        } catch (err) {
+          notify(err instanceof Error ? err.message : 'Unable to create account.', 'error');
+          return false;
+        }
+      }
+
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        if (fullName?.trim()) {
+          await updateProfile(cred.user, { displayName: fullName.trim() });
+        }
+        const token = await cred.user.getIdToken(true);
+        await syncWithToken(token);
+        notify('Account created and signed in.', 'ok');
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to create account.';
+        if (msg.includes('operation-not-allowed')) {
+          notify(
+            'Enable Email/Password sign-in in Firebase Console (Authentication → Sign-in method) or configure Supabase Auth.',
+            'error',
+          );
+        } else {
+          notify(msg, 'error');
+        }
+        return false;
+      }
+    },
+    [authProvider, notify, syncWithToken],
+  );
+
+  const sendPasswordReset = useCallback(
+    async (email: string): Promise<boolean> => {
+      const cleanEmail = email.trim().toLowerCase();
+      if (!cleanEmail) {
+        notify('Enter your email address first.', 'error');
+        return false;
+      }
+      try {
+        if (authProvider === 'supabase' && supabase) {
+          const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+            redirectTo: `${window.location.origin}/#/account`,
+          });
+          if (error) throw error;
+        } else {
+          await sendPasswordResetEmail(auth, cleanEmail);
+        }
+        notify('Password reset instructions sent to your email.', 'ok');
+        return true;
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Unable to send password reset email.', 'error');
+        return false;
+      }
+    },
+    [authProvider, notify],
+  );
 
   const signOutUser = useCallback(async () => {
-    await signOut(auth);
+    if (authProvider === 'supabase' && supabase) {
+      await supabase.auth.signOut();
+    } else {
+      await signOut(auth);
+    }
+    setFirebaseUser(null);
     setDbUser(null);
     notify('Signed out of Raw.hairs.', 'info');
     if (route.page === 'admin' || route.page === 'dispatch') {
       navigate({ page: 'home' });
     }
-  }, [navigate, notify, route.page]);
+  }, [authProvider, navigate, notify, route.page]);
 
   const refreshDbUser = useCallback(async () => {
-    await syncUserProfile(auth.currentUser);
-  }, [syncUserProfile]);
+    const token = await getIdToken();
+    await syncWithToken(token);
+  }, [getIdToken, syncWithToken]);
 
   const addToCart = useCallback(
     (line: CartLine) => {
@@ -342,11 +572,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     clearCart,
     cartCount,
     cartSubtotalNgn,
+    authProvider,
     firebaseUser,
     dbUser,
     authReady,
     getIdToken,
     signInWithGoogle,
+    signInWithEmail,
+    signUpWithEmail,
+    sendPasswordReset,
     signOutUser,
     refreshDbUser,
     notify,

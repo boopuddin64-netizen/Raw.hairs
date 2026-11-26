@@ -152,6 +152,7 @@ export const orders = pgTable('orders', {
   bankTransferVerifiedAt: timestamp('bank_transfer_verified_at'),
   status: text('status').notNull().default('pending_payment'),
   assignedRiderUid: text('assigned_rider_uid'),
+  deliveryOtp: text('delivery_otp'),
   deliveryProofMode: text('delivery_proof_mode'),
   deliveryProofValue: text('delivery_proof_value'),
   deliveredAt: timestamp('delivered_at'),
@@ -300,7 +301,7 @@ export const storeSettings = pgTable('store_settings', {
   bankTransferInstructions: text('bank_transfer_instructions')
     .notNull()
     .default('Use your order reference as transfer narration, then upload your receipt and transaction code for Admin confirmation.'),
-  deliveryProofMode: text('delivery_proof_mode').notNull().default('rider_confirm'), // 'otp' | 'photo' | 'rider_confirm'
+  deliveryProofMode: text('delivery_proof_mode').notNull().default('otp_photo'), // 'otp_photo' | 'otp' | 'photo' | 'rider_confirm'
   returnWindowHours: integer('return_window_hours').notNull().default(48),
   returnEligibilityNotes: text('return_eligibility_notes').notNull(),
   whatsappProvider: text('whatsapp_provider').notNull().default('meta_cloud'),

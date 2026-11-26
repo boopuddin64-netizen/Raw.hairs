@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { LogOut, Shield, Truck, Upload } from 'lucide-react';
+import { Eye, EyeOff, LogOut, Shield, Truck, Upload } from 'lucide-react';
 import { useStore } from '../context/StoreContext.tsx';
 import { apiRequest } from '../lib/api.ts';
 import {
@@ -19,10 +19,14 @@ interface AccountSummary {
 
 export function AccountPage() {
   const {
+    authProvider,
     firebaseUser,
     dbUser,
     authReady,
     signInWithGoogle,
+    signInWithEmail,
+    signUpWithEmail,
+    sendPasswordReset,
     signOutUser,
     getIdToken,
     refreshDbUser,
@@ -30,6 +34,13 @@ export function AccountPage() {
     navigate,
     notify,
   } = useStore();
+
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authFullName, setAuthFullName] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
 
   const [tab, setTab] = useState<'orders' | 'bookings' | 'quotes' | 'returns' | 'profile'>('orders');
   const [summary, setSummary] = useState<AccountSummary>({
@@ -155,6 +166,20 @@ export function AccountPage() {
     }
   };
 
+  const handleEmailAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    try {
+      if (authMode === 'signin') {
+        await signInWithEmail(authEmail, authPassword);
+      } else {
+        await signUpWithEmail(authEmail, authPassword, authFullName);
+      }
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
   if (!authReady) {
     return (
       <div className="mx-auto max-w-4xl px-5 py-16">
@@ -165,19 +190,111 @@ export function AccountPage() {
 
   if (!firebaseUser) {
     return (
-      <div className="mx-auto max-w-xl px-5 py-16">
-        <div className="rounded-3xl border border-[var(--line)] bg-[var(--surface)] p-8 sm:p-10 text-center">
-          <p className="text-xs uppercase tracking-[0.2em] text-[var(--accent)]">Raw.hairs Member Hub</p>
-          <h1 className="mt-2 font-display text-4xl font-medium">Sign In to Your Account</h1>
-          <p className="mt-3 text-sm text-[var(--muted)]">
-            View orders, file 48-hour return claims, manage Port Harcourt salon bookings, and respond to international quotes.
-          </p>
+      <div className="mx-auto max-w-xl px-4 sm:px-5 py-12 sm:py-16">
+        <div className="rounded-3xl border border-[var(--line)] bg-[var(--surface)] p-6 sm:p-10">
+          <div className="text-center">
+            <p className="text-xs uppercase tracking-[0.2em] text-[var(--accent)]">Raw.hairs Member Hub</p>
+            <h1 className="mt-2 font-display text-3xl sm:text-4xl font-medium">
+              {authMode === 'signin' ? 'Sign In to Your Account' : 'Create Your Account'}
+            </h1>
+            <p className="mt-3 text-sm text-[var(--muted)]">
+              View orders, file 48-hour return claims, manage Port Harcourt salon bookings, and respond to international quotes.
+            </p>
+          </div>
+
+          <form onSubmit={handleEmailAuthSubmit} className="mt-6 space-y-3.5">
+            {authMode === 'signup' && (
+              <div>
+                <label className="block text-xs uppercase tracking-[0.12em] text-[var(--muted)] mb-1">Full Name</label>
+                <input
+                  required
+                  value={authFullName}
+                  onChange={(e) => setAuthFullName(e.target.value)}
+                  placeholder="Amaka Okafor"
+                  className="h-11 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3.5 text-sm"
+                />
+              </div>
+            )}
+            <div>
+              <label className="block text-xs uppercase tracking-[0.12em] text-[var(--muted)] mb-1">Email</label>
+              <input
+                required
+                type="email"
+                autoComplete="email"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                placeholder="you@example.com"
+                className="h-11 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3.5 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs uppercase tracking-[0.12em] text-[var(--muted)] mb-1">Password</label>
+              <div className="relative">
+                <input
+                  required
+                  type={showPassword ? 'text' : 'password'}
+                  minLength={authMode === 'signup' ? 8 : 6}
+                  autoComplete={authMode === 'signin' ? 'current-password' : 'new-password'}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder={authMode === 'signup' ? 'At least 8 characters' : 'Enter your password'}
+                  className="h-11 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] pl-3.5 pr-11 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((s) => !s)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 text-[var(--muted)] hover:text-[var(--ink)] cursor-pointer"
+                >
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full min-h-[44px] rounded-full bg-[var(--accent)] py-3 text-xs font-medium uppercase tracking-[0.14em] text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 cursor-pointer"
+            >
+              {authSubmitting
+                ? 'Please wait...'
+                : authMode === 'signin'
+                  ? 'Sign In with Email'
+                  : 'Create Account'}
+            </button>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs text-[var(--muted)]">
+              <button
+                type="button"
+                onClick={() => setAuthMode((m) => (m === 'signin' ? 'signup' : 'signin'))}
+                className="underline hover:text-[var(--ink)] cursor-pointer"
+              >
+                {authMode === 'signin' ? 'Need an account? Sign up' : 'Already have an account? Sign in'}
+              </button>
+              {authMode === 'signin' && (
+                <button
+                  type="button"
+                  onClick={() => void sendPasswordReset(authEmail)}
+                  className="underline hover:text-[var(--ink)] cursor-pointer"
+                >
+                  Forgot password?
+                </button>
+              )}
+            </div>
+
+            <div className="relative py-2">
+              <div className="border-t border-[var(--line)]" />
+              <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-[var(--surface)] px-3 text-[11px] uppercase tracking-[0.14em] text-[var(--muted)]">
+                Or
+              </span>
+            </div>
+          </form>
+
           <button
             type="button"
             onClick={() => void signInWithGoogle()}
-            className="mt-7 w-full rounded-full bg-[var(--accent)] py-3.5 text-xs font-medium uppercase tracking-[0.14em] text-[var(--accent-ink)] hover:opacity-90 cursor-pointer"
+            className="mt-2 w-full min-h-[44px] rounded-full border border-[var(--line-2)] bg-[var(--bg)] py-3.5 text-xs font-medium uppercase tracking-[0.14em] text-[var(--ink)] hover:border-[var(--accent)] cursor-pointer"
           >
-            Continue with Google
+            Continue with Google ({authProvider === 'supabase' ? 'OAuth' : 'Google'})
           </button>
         </div>
       </div>
@@ -304,6 +421,22 @@ export function AccountPage() {
                         </span>
                         <span className="uppercase" style={{ color: order.paymentStatus === 'paid' ? 'var(--ok)' : 'var(--champagne)' }}>
                           {order.paymentStatus === 'paid' ? 'Confirmed by Admin' : 'Awaiting Admin Confirmation'}
+                        </span>
+                      </div>
+                    )}
+
+                    {order.deliveryOtp && order.status !== 'delivered' && (
+                      <div className="mt-3 rounded-2xl border border-[var(--accent)]/40 bg-[var(--surface-2)] px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs">
+                          <span className="uppercase tracking-[0.12em] text-[var(--accent)] font-medium">
+                            Customer Delivery OTP
+                          </span>
+                          <p className="text-[var(--muted)] mt-0.5">
+                            Give this code to your rider only at handoff.
+                          </p>
+                        </div>
+                        <span className="font-mono-num text-xl font-semibold tracking-[0.22em] text-[var(--ink)]">
+                          {order.deliveryOtp}
                         </span>
                       </div>
                     )}

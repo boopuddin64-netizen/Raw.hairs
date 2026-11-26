@@ -35,7 +35,7 @@ export interface CommerceSettings {
   bankAccountNumber: string;
   bankAccountName: string;
   bankTransferInstructions: string;
-  deliveryProofMode: 'otp' | 'photo' | 'rider_confirm';
+  deliveryProofMode: 'otp_photo' | 'otp' | 'photo' | 'rider_confirm';
   returnWindowHours: number;
   returnEligibilityNotes: string;
   whatsappProvider?: string;
@@ -152,6 +152,9 @@ export interface OrderRecord {
   bankTransferVerifiedAt?: string | null;
   status: string;
   assignedRiderUid: string | null;
+  deliveryOtp?: string | null;
+  deliveryProofMode?: string | null;
+  deliveryProofValue?: string | null;
   deliveredAt: string | null;
   createdAt: string;
   items?: OrderItem[];
@@ -215,6 +218,7 @@ export interface DeliveryJob {
   step: 'assigned' | 'picked_up' | 'on_the_way' | 'delivered';
   proofType: string | null;
   proofNote: string | null;
+  proofPhotoData?: string | null;
   issueReport: string | null;
   updatedAt: string;
 }

@@ -1,12 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
-import { and, desc, eq, gt, inArray, lt, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gt, ilike, inArray, lt, or, sql } from 'drizzle-orm';
 import { createServer as createViteServer } from 'vite';
-import { db } from './src/db/index.ts';
+import { db, verifyAndFallbackDb } from './src/db/index.ts';
 import {
   auditLogs,
   bookings,
@@ -51,6 +52,10 @@ const ORDER_TRANSITIONS: Record<string, string[]> = {
 
 function makeCode(prefix: string) {
   return `${prefix}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+}
+
+function generateDeliveryOtp() {
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 async function expireStaleReservations() {
@@ -171,7 +176,9 @@ async function commitOrderPayment(params: {
 }
 
 async function startServer() {
+  await verifyAndFallbackDb();
   const app = express();
+  const httpServer = http.createServer(app);
 
   // Raw body parser exclusively for Paystack HMAC-SHA512 webhook verification
   app.post(
@@ -303,7 +310,38 @@ async function startServer() {
       });
     } catch (error) {
       console.error('Bootstrap error:', error);
-      res.status(500).json({ error: 'Unable to load storefront catalogue right now.' });
+      const errObj = error as { cause?: { code?: string; message?: string }; code?: string; message?: string };
+      const cause = errObj?.cause || errObj;
+      const code = cause?.code || errObj?.code || '';
+      const rawMsg = cause?.message || errObj?.message || '';
+      const msg = String(rawMsg).replace(/postgres(?:ql)?:\/\/[^\s]+/gi, '[REDACTED_URL]');
+
+      if (code === '28P01' || msg.includes('password authentication failed')) {
+        return res.status(500).json({
+          error:
+            'Supabase Postgres authentication failed. Check SUPABASE_DB_URL: use the Session Pooler username (postgres.<project-ref>), remove any [ ] brackets around the password, and verify your Project Database Password in Supabase Settings → Database.',
+        });
+      }
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'ENETUNREACH' ||
+        msg.includes('ECONNREFUSED') ||
+        msg.includes('ENETUNREACH')
+      ) {
+        return res.status(500).json({
+          error:
+            'Cannot reach Supabase direct DB host over IPv6 from this server. In Supabase Dashboard → Connect, switch Method from "Direct connection" to "Session pooler" (IPv4 compatible, aws-0-*.pooler.supabase.com:5432) and update SUPABASE_DB_URL.',
+        });
+      }
+      if (code === '42P01' || msg.includes('does not exist')) {
+        return res.status(500).json({
+          error:
+            'Connected to Supabase Postgres, but Raw.hairs tables have not been pushed yet. Ready to inspect existing tables first.',
+        });
+      }
+      res.status(500).json({
+        error: `Unable to load storefront catalogue right now${code || msg ? ` (${[code, msg].filter(Boolean).join(': ')})` : ''}.`,
+      });
     }
   });
 
@@ -846,6 +884,8 @@ async function startServer() {
           paymentStatus: order.paymentStatus,
           bankTransactionCode: order.bankTransactionCode,
           hasReceipt: Boolean(order.bankTransferReceipt),
+          deliveryOtp: contact && order.deliveryOtp && order.status !== 'delivered' ? order.deliveryOtp : null,
+          deliveryProofMode: order.deliveryProofMode,
           status: order.status,
           deliveredAt: order.deliveredAt,
           createdAt: order.createdAt,
@@ -1199,7 +1239,7 @@ async function startServer() {
 
       res.json({
         jobs,
-        deliveryProofMode: settings?.deliveryProofMode || 'rider_confirm',
+        deliveryProofMode: settings?.deliveryProofMode || 'otp_photo',
       });
     } catch (error) {
       console.error('Driver jobs error:', error);
@@ -1229,15 +1269,53 @@ async function startServer() {
         }
 
         const [settings] = await db.select().from(storeSettings).where(eq(storeSettings.key, 'commerce')).limit(1);
-        const proofMode = settings?.deliveryProofMode || 'rider_confirm';
+        const proofMode = settings?.deliveryProofMode || 'otp_photo';
+
+        const [linkedOrder] = await db
+          .select()
+          .from(orders)
+          .where(eq(orders.id, job.orderId))
+          .limit(1);
+
+        const cleanOtp = String(proofNote || '').trim();
+        const cleanPhoto = String(proofPhotoData || '').trim();
 
         if (nextStep === 'delivered') {
-          if (proofMode === 'otp' && !proofNote?.trim()) {
-            return res.status(400).json({ error: 'Customer OTP confirmation code is required.' });
+          const requiresOtp = proofMode === 'otp_photo' || proofMode === 'otp';
+          const requiresPhoto = proofMode === 'otp_photo' || proofMode === 'photo';
+
+          if (requiresOtp) {
+            if (!/^\d{6}$/.test(cleanOtp)) {
+              return res.status(400).json({
+                error: 'Enter the customer’s 6-digit Delivery OTP code to confirm handoff.',
+              });
+            }
+            if (linkedOrder?.deliveryOtp) {
+              const enteredBuf = Buffer.from(cleanOtp);
+              const expectedBuf = Buffer.from(linkedOrder.deliveryOtp);
+              if (enteredBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(enteredBuf, expectedBuf)) {
+                return res.status(400).json({
+                  error: 'Customer Delivery OTP does not match. Ask the customer for their 6-digit OTP code.',
+                });
+              }
+            }
           }
-          if (proofMode === 'photo' && !proofPhotoData?.trim()) {
-            return res.status(400).json({ error: 'Delivery photo proof is required.' });
+
+          if (requiresPhoto) {
+            if (
+              !/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(cleanPhoto) ||
+              cleanPhoto.length > 4_500_000
+            ) {
+              return res.status(400).json({
+                error: 'Attach a valid PNG, JPG, or WebP delivery confirmation image (max 3MB).',
+              });
+            }
           }
+        }
+
+        let ensuredOtp = linkedOrder?.deliveryOtp || null;
+        if (nextStep === 'on_the_way' && linkedOrder && !ensuredOtp) {
+          ensuredOtp = generateDeliveryOtp();
         }
 
         const [updatedJob] = await db
@@ -1245,8 +1323,8 @@ async function startServer() {
           .set({
             step: nextStep,
             proofType: nextStep === 'delivered' ? proofMode : job.proofType,
-            proofNote: proofNote ? String(proofNote).trim().slice(0, 300) : job.proofNote,
-            proofPhotoData: proofPhotoData ? String(proofPhotoData) : job.proofPhotoData,
+            proofNote: cleanOtp ? cleanOtp.slice(0, 300) : job.proofNote,
+            proofPhotoData: cleanPhoto ? cleanPhoto : job.proofPhotoData,
             updatedAt: new Date(),
           })
           .where(eq(deliveries.id, deliveryId))
@@ -1263,20 +1341,18 @@ async function startServer() {
           .update(orders)
           .set({
             status: orderStatus,
+            deliveryOtp: ensuredOtp || linkedOrder?.deliveryOtp || null,
             deliveredAt: nextStep === 'delivered' ? new Date() : undefined,
             deliveryProofMode: nextStep === 'delivered' ? proofMode : undefined,
-            deliveryProofValue: proofNote ? String(proofNote).trim().slice(0, 120) : undefined,
+            deliveryProofValue: cleanOtp ? cleanOtp.slice(0, 120) : undefined,
             updatedAt: new Date(),
           })
           .where(eq(orders.id, job.orderId));
 
-        const [linkedOrder] = await db
-          .select({ customerEmail: orders.customerEmail })
-          .from(orders)
-          .where(eq(orders.id, job.orderId))
-          .limit(1);
-
         if (nextStep === 'on_the_way') {
+          const otpLine = ensuredOtp
+            ? ` Your 6-digit Delivery OTP is ${ensuredOtp} — share it only with your rider upon handoff.`
+            : '';
           await dispatchNotification({
             eventType: 'order.dispatched',
             entityId: job.orderNumber,
@@ -1284,7 +1360,7 @@ async function startServer() {
             recipientEmail: linkedOrder?.customerEmail || null,
             emailSubject: `Raw.hairs Dispatch — Order ${job.orderNumber} is On the Way`,
             dedupeSuffix: 'on_the_way',
-            messageBody: `Raw.hairs Dispatch: Rider ${job.assignedRiderName} is on the way to ${job.deliveryZone} with your Order ${job.orderNumber}.`,
+            messageBody: `Raw.hairs Dispatch: Rider ${job.assignedRiderName} is on the way to ${job.deliveryZone} with your Order ${job.orderNumber}.${otpLine}`,
           });
         } else if (nextStep === 'delivered') {
           await dispatchNotification({
@@ -1294,9 +1370,9 @@ async function startServer() {
             recipientEmail: linkedOrder?.customerEmail || null,
             emailSubject: `Raw.hairs — Order ${job.orderNumber} Delivered`,
             notifyAdminEmail: true,
-            adminMessageBody: `Order ${job.orderNumber} marked DELIVERED by ${job.assignedRiderName} (${job.deliveryZone}).`,
+            adminMessageBody: `Order ${job.orderNumber} marked DELIVERED by ${job.assignedRiderName} (${job.deliveryZone}). Proof mode: ${proofMode}.`,
             dedupeSuffix: 'delivered',
-            messageBody: `Raw.hairs: Order ${job.orderNumber} has been delivered. Enjoy your crown! Note: any return claim must be filed within ${settings?.returnWindowHours || 48} hours.`,
+            messageBody: `Raw.hairs: Order ${job.orderNumber} has been delivered and confirmed. Enjoy your crown! Note: any return claim must be filed within ${settings?.returnWindowHours || 48} hours.`,
           });
         }
 
@@ -1418,7 +1494,8 @@ async function startServer() {
         returns: allReturns,
         deliveries: allDeliveries,
         services: allServices,
-        users: allUsers,
+        users: allUsers.slice(0, 50),
+        riders: allUsers.filter((u) => u.role === 'dispatch' && u.isActive),
         auditLogs: allLogs,
         inventoryLogs: allInvLogs,
         notifications: allNotifications,
@@ -1694,11 +1771,15 @@ async function startServer() {
         assignedRiderName = rider?.fullName || rider?.email || 'Port Harcourt Rider';
       }
 
+      const needsOtp = ['approved', 'ready_for_dispatch', 'out_for_delivery'].includes(nextStatus);
+      const nextOtp = needsOtp ? order.deliveryOtp || generateDeliveryOtp() : order.deliveryOtp;
+
       const [updated] = await db
         .update(orders)
         .set({
           status: nextStatus,
           assignedRiderUid: resolvedRiderUid || order.assignedRiderUid,
+          deliveryOtp: nextOtp,
           deliveredAt: nextStatus === 'delivered' ? new Date() : order.deliveredAt,
           paymentStatus: nextStatus === 'refunded' ? 'refunded' : order.paymentStatus,
           updatedAt: new Date(),
@@ -1739,7 +1820,7 @@ async function startServer() {
           recipientEmail: updated.customerEmail,
           emailSubject: `Raw.hairs — Order ${updated.orderNumber} Approved`,
           dedupeSuffix: 'approved',
-          messageBody: `Raw.hairs: Order ${updated.orderNumber} is approved and entering quality inspection & silk packaging.`,
+          messageBody: `Raw.hairs: Order ${updated.orderNumber} is approved and entering quality inspection & silk packaging. Your 6-digit Delivery OTP is ${updated.deliveryOtp}.`,
         });
       } else if (nextStatus === 'out_for_delivery') {
         await dispatchNotification({
@@ -1749,7 +1830,7 @@ async function startServer() {
           recipientEmail: updated.customerEmail,
           emailSubject: `Raw.hairs Dispatch — Order ${updated.orderNumber} Dispatched`,
           dedupeSuffix: 'dispatched',
-          messageBody: `Raw.hairs: Order ${updated.orderNumber} is now out for delivery to ${updated.deliveryZone} with ${assignedRiderName}.`,
+          messageBody: `Raw.hairs: Order ${updated.orderNumber} is now out for delivery to ${updated.deliveryZone} with ${assignedRiderName}. Share your 6-digit Delivery OTP (${updated.deliveryOtp}) only with your rider at handoff.`,
         });
       }
 
@@ -1822,6 +1903,7 @@ async function startServer() {
           .set({
             paymentStatus: 'paid',
             status: 'approved',
+            deliveryOtp: order.deliveryOtp || generateDeliveryOtp(),
             bankTransferVerifiedBy: req.dbUser!.email,
             bankTransferVerifiedAt: new Date(),
             updatedAt: new Date(),
@@ -1867,7 +1949,7 @@ async function startServer() {
         recipientEmail: updated.customerEmail,
         emailSubject: `Raw.hairs — Bank Transfer Confirmed (${updated.orderNumber})`,
         dedupeSuffix: `bt-confirmed-${updated.orderNumber}`,
-        messageBody: `Raw.hairs: Your bank transfer (${updated.bankTransactionCode}) for Order ${updated.orderNumber} has been confirmed! Your order is approved for dispatch.`,
+        messageBody: `Raw.hairs: Your bank transfer (${updated.bankTransactionCode}) for Order ${updated.orderNumber} has been confirmed! Your order is approved for dispatch. Your 6-digit Delivery OTP is ${updated.deliveryOtp} — share it only with your rider at handoff.`,
       });
 
       await writeAuditLog({
@@ -2091,6 +2173,184 @@ async function startServer() {
     }
   });
 
+  // Admin: Paginated & Filterable User Directory (Staff & OwnerAdmin)
+  app.get('/api/admin/users', requireAuth, requireRole('staff', 'owneradmin'), async (req: AuthRequest, res) => {
+    try {
+      const searchRaw = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 100) : '';
+      const roleFilter = typeof req.query.role === 'string' ? req.query.role : 'all';
+      const statusFilter = typeof req.query.status === 'string' ? req.query.status : 'all';
+      const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+      const pageSize = Math.min(50, Math.max(5, Number.parseInt(String(req.query.pageSize || '12'), 10) || 12));
+
+      const conditions = [];
+      if (roleFilter !== 'all' && ['customer', 'dispatch', 'staff', 'owneradmin'].includes(roleFilter)) {
+        conditions.push(eq(users.role, roleFilter));
+      }
+      if (statusFilter === 'active') {
+        conditions.push(eq(users.isActive, true));
+      } else if (statusFilter === 'suspended') {
+        conditions.push(eq(users.isActive, false));
+      }
+      if (searchRaw) {
+        const escaped = searchRaw.replace(/[%_\\]/g, '\\$&');
+        const pattern = `%${escaped}%`;
+        conditions.push(or(ilike(users.email, pattern), ilike(users.fullName, pattern), ilike(users.phone, pattern)));
+      }
+
+      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+      const [matchedUsers, totalRows, groupedCounts] = await Promise.all([
+        db
+          .select({
+            id: users.id,
+            uid: users.uid,
+            email: users.email,
+            fullName: users.fullName,
+            phone: users.phone,
+            role: users.role,
+            defaultState: users.defaultState,
+            defaultZone: users.defaultZone,
+            defaultAddress: users.defaultAddress,
+            isActive: users.isActive,
+            createdAt: users.createdAt,
+          })
+          .from(users)
+          .where(whereClause)
+          .orderBy(
+            sql`CASE ${users.role} WHEN 'owneradmin' THEN 0 WHEN 'staff' THEN 1 WHEN 'dispatch' THEN 2 ELSE 3 END`,
+            desc(users.createdAt),
+          )
+          .limit(pageSize)
+          .offset((page - 1) * pageSize),
+        db.select({ total: count() }).from(users).where(whereClause),
+        db
+          .select({
+            role: users.role,
+            isActive: users.isActive,
+            total: count(),
+          })
+          .from(users)
+          .groupBy(users.role, users.isActive),
+      ]);
+
+      const counts = {
+        all: 0,
+        customer: 0,
+        dispatch: 0,
+        staff: 0,
+        owneradmin: 0,
+        active: 0,
+        suspended: 0,
+      };
+      for (const row of groupedCounts) {
+        const n = Number(row.total) || 0;
+        counts.all += n;
+        if (row.role === 'customer' || row.role === 'dispatch' || row.role === 'staff' || row.role === 'owneradmin') {
+          counts[row.role] += n;
+        }
+        if (row.isActive) counts.active += n;
+        else counts.suspended += n;
+      }
+
+      const total = Number(totalRows[0]?.total || 0);
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+      res.json({
+        users: matchedUsers,
+        total,
+        page: Math.min(page, totalPages),
+        pageSize,
+        totalPages,
+        counts,
+      });
+    } catch (error) {
+      console.error('Admin users list error:', error);
+      res.status(500).json({ error: 'Unable to load users directory.' });
+    }
+  });
+
+  // Admin: Pre-Register Driver, Staff, or Customer by Email (OwnerAdmin Only)
+  app.post('/api/admin/users', requireAuth, requireRole('owneradmin'), async (req: AuthRequest, res) => {
+    try {
+      const { email, fullName, phone, role, defaultZone } = req.body || {};
+      const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase().slice(0, 160) : '';
+      const cleanName = typeof fullName === 'string' ? fullName.trim().slice(0, 120) : '';
+      const cleanPhone = typeof phone === 'string' ? phone.trim().slice(0, 30) : '';
+      const assignedRole = typeof role === 'string' && ['customer', 'dispatch', 'staff', 'owneradmin'].includes(role)
+        ? role
+        : 'dispatch';
+      const cleanZone = typeof defaultZone === 'string' && defaultZone.trim() ? defaultZone.trim().slice(0, 40) : 'ph-gra';
+
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+        return res.status(400).json({ error: 'Enter a valid email address.' });
+      }
+      if (cleanName.length < 2) {
+        return res.status(400).json({ error: 'Enter the team member’s full name.' });
+      }
+
+      const existing = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`LOWER(${users.email}) = LOWER(${cleanEmail})`)
+        .limit(1);
+
+      if (existing.length > 0) {
+        return res.status(409).json({
+          error: 'An account with this email already exists. Update their role from the directory below.',
+        });
+      }
+
+      const pendingUid = `pending-${crypto.randomBytes(6).toString('hex')}`;
+      const [created] = await db
+        .insert(users)
+        .values({
+          uid: pendingUid,
+          email: cleanEmail,
+          fullName: cleanName,
+          phone: cleanPhone || null,
+          role: assignedRole,
+          defaultState: 'Rivers',
+          defaultZone: cleanZone,
+          isActive: true,
+        })
+        .returning();
+
+      await writeAuditLog({
+        actorUid: req.dbUser!.uid,
+        actorEmail: req.dbUser!.email,
+        actorRole: req.dbUser!.role,
+        action: 'rbac.user_provisioned',
+        entityType: 'user',
+        entityId: created.uid,
+        details: { email: cleanEmail, role: assignedRole },
+      });
+
+      const roleLabel =
+        assignedRole === 'dispatch'
+          ? 'Dispatch Rider'
+          : assignedRole === 'staff'
+            ? 'Operations Staff'
+            : assignedRole === 'owneradmin'
+              ? 'Owner Admin'
+              : 'Customer';
+
+      await dispatchNotification({
+        eventType: 'team.invited',
+        entityId: cleanEmail,
+        recipientEmail: cleanEmail,
+        recipientPhone: cleanPhone || undefined,
+        notifyAdminEmail: false,
+        emailSubject: `Raw.hairs — Your ${roleLabel} Access Is Ready`,
+        messageBody: `Hello ${cleanName}, your Raw.hairs ${roleLabel} access is ready. Visit the Account page and create an account or sign in using ${cleanEmail} to activate your workspace.`,
+      });
+
+      res.status(201).json({ user: created });
+    } catch (error) {
+      console.error('Admin user provision error:', error);
+      res.status(500).json({ error: 'Unable to add team member.' });
+    }
+  });
+
   // Admin: Staff & RBAC Role Management (OwnerAdmin Only)
   app.patch('/api/admin/users/:uid/role', requireAuth, requireRole('owneradmin'), async (req: AuthRequest, res) => {
     try {
@@ -2098,6 +2358,9 @@ async function startServer() {
       const { role, isActive } = req.body || {};
       if (role && !['customer', 'dispatch', 'staff', 'owneradmin'].includes(role)) {
         return res.status(400).json({ error: 'Invalid role.' });
+      }
+      if (targetUid === req.dbUser!.uid && (isActive === false || (role && role !== 'owneradmin'))) {
+        return res.status(400).json({ error: 'You cannot suspend or demote your own active owneradmin account.' });
       }
 
       const [updated] = await db
@@ -2165,7 +2428,7 @@ async function startServer() {
             typeof payload.bankTransferInstructions === 'string' && payload.bankTransferInstructions.trim()
               ? payload.bankTransferInstructions.trim().slice(0, 600)
               : current.bankTransferInstructions,
-          deliveryProofMode: ['otp', 'photo', 'rider_confirm'].includes(payload.deliveryProofMode)
+          deliveryProofMode: ['otp_photo', 'otp', 'photo', 'rider_confirm'].includes(payload.deliveryProofMode)
             ? payload.deliveryProofMode
             : current.deliveryProofMode,
           returnWindowHours:
@@ -2205,7 +2468,12 @@ async function startServer() {
   // Mount Vite Dev Middleware or Serve Static Production Build
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        allowedHosts: true,
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -2222,7 +2490,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Raw.hairs server listening on http://0.0.0.0:${PORT}`);
   });
 }

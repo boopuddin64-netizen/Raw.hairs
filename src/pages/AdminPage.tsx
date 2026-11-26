@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, RefreshCw, Search, UserPlus } from 'lucide-react';
 import { useStore } from '../context/StoreContext.tsx';
 import { apiRequest } from '../lib/api.ts';
 import {
@@ -46,6 +46,7 @@ interface AdminOverviewData {
   deliveries: DeliveryJob[];
   services: SalonService[];
   users: DbUser[];
+  riders?: DbUser[];
   auditLogs: Array<{
     id: number;
     actorEmail: string | null;
@@ -75,6 +76,23 @@ interface AdminOverviewData {
     createdAt: string;
   }>;
   settings: CommerceSettings;
+}
+
+interface AdminUsersResponse {
+  users: DbUser[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  counts: {
+    all: number;
+    customer: number;
+    dispatch: number;
+    staff: number;
+    owneradmin: number;
+    active: number;
+    suspended: number;
+  };
 }
 
 type AdminSection =
@@ -133,7 +151,24 @@ export function AdminPage() {
     orderNumber: string;
     code: string;
     image: string;
+    label?: string;
   } | null>(null);
+
+  const [userSearchInput, setUserSearchInput] = useState('');
+  const [userSearchApplied, setUserSearchApplied] = useState('');
+  const [userRoleFilter, setUserRoleFilter] = useState<'all' | 'dispatch' | 'staff' | 'owneradmin' | 'customer'>('all');
+  const [userStatusFilter, setUserStatusFilter] = useState<'all' | 'active' | 'suspended'>('all');
+  const [userPage, setUserPage] = useState(1);
+  const [usersDir, setUsersDir] = useState<AdminUsersResponse | null>(null);
+  const [usersLoading, setUsersLoading] = useState(false);
+
+  const [addUserOpen, setAddUserOpen] = useState(false);
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPhone, setNewUserPhone] = useState('');
+  const [newUserRole, setNewUserRole] = useState<'dispatch' | 'staff' | 'customer'>('dispatch');
+  const [newUserZone, setNewUserZone] = useState('ph-gra');
+  const [addingUser, setAddingUser] = useState(false);
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
@@ -149,6 +184,26 @@ export function AdminPage() {
     }
   }, [getIdToken, notify]);
 
+  const loadUsersDirectory = useCallback(async () => {
+    setUsersLoading(true);
+    try {
+      const token = await getIdToken();
+      const qs = new URLSearchParams({
+        page: String(userPage),
+        pageSize: '12',
+        role: userRoleFilter,
+        status: userStatusFilter,
+      });
+      if (userSearchApplied) qs.set('search', userSearchApplied);
+      const res = await apiRequest<AdminUsersResponse>(`/api/admin/users?${qs.toString()}`, { token });
+      setUsersDir(res);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to load user directory.', 'error');
+    } finally {
+      setUsersLoading(false);
+    }
+  }, [getIdToken, notify, userPage, userRoleFilter, userSearchApplied, userStatusFilter]);
+
   useEffect(() => {
     if (dbUser && ['staff', 'owneradmin'].includes(dbUser.role)) {
       void loadOverview();
@@ -156,6 +211,12 @@ export function AdminPage() {
       setLoading(false);
     }
   }, [dbUser, loadOverview]);
+
+  useEffect(() => {
+    if (dbUser && ['staff', 'owneradmin'].includes(dbUser.role) && section === 'rbac') {
+      void loadUsersDirectory();
+    }
+  }, [dbUser, loadUsersDirectory, section]);
 
   if (!authReady || loading) {
     return (
@@ -185,7 +246,7 @@ export function AdminPage() {
     );
   }
 
-  const riders = (data?.users || []).filter((u) => u.role === 'dispatch' && u.isActive);
+  const riders = data?.riders || (data?.users || []).filter((u) => u.role === 'dispatch' && u.isActive);
 
   const handleOrderTransition = async (orderId: number, nextStatus: string) => {
     try {
@@ -358,9 +419,39 @@ export function AdminPage() {
         body: JSON.stringify({ role, isActive }),
       });
       notify('Staff/RBAC role updated.', 'ok');
-      await loadOverview();
+      await Promise.all([loadOverview(), loadUsersDirectory()]);
     } catch (err) {
       notify(err instanceof Error ? err.message : 'RBAC update failed.', 'error');
+    }
+  };
+
+  const handleProvisionUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAddingUser(true);
+    try {
+      const token = await getIdToken();
+      await apiRequest('/api/admin/users', {
+        method: 'POST',
+        token,
+        body: JSON.stringify({
+          fullName: newUserName,
+          email: newUserEmail,
+          phone: newUserPhone,
+          role: newUserRole,
+          defaultZone: newUserZone,
+        }),
+      });
+      notify('Team member added. Their role activates as soon as they sign in with this email.', 'ok');
+      setNewUserName('');
+      setNewUserEmail('');
+      setNewUserPhone('');
+      setAddUserOpen(false);
+      setUserPage(1);
+      await Promise.all([loadOverview(), loadUsersDirectory()]);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to add user.', 'error');
+    } finally {
+      setAddingUser(false);
     }
   };
 
@@ -483,6 +574,11 @@ export function AdminPage() {
                       <span className="uppercase font-medium text-[var(--accent)]">
                         {order.status.replace(/_/g, ' ')}
                       </span>
+                      {order.deliveryOtp && (
+                        <span className="rounded-lg border border-[var(--champagne)]/40 bg-[var(--surface-2)] px-2.5 py-0.5 font-mono-num text-[var(--champagne)]">
+                          OTP: {order.deliveryOtp}
+                        </span>
+                      )}
                       <span className="font-mono-num text-sm font-medium">{formatNaira(order.totalNgn)}</span>
                     </div>
                   </div>
@@ -891,16 +987,47 @@ export function AdminPage() {
               {data.deliveries.map((d) => (
                 <div
                   key={d.id}
-                  className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-5 flex flex-wrap justify-between gap-3"
+                  className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-5 flex flex-wrap items-center justify-between gap-3"
                 >
-                  <div>
+                  <div className="space-y-1">
                     <p className="font-mono-num font-medium">{d.orderNumber}</p>
                     <p className="text-xs text-[var(--muted)]">
                       Rider: {d.assignedRiderName} · Zone: {d.deliveryZone}
                     </p>
+                    {(d.proofType || d.proofNote) && (
+                      <p className="text-xs text-[var(--ok)]">
+                        Proof: {(d.proofType || 'verified').replace(/_/g, ' ')}
+                        {d.proofNote ? ` · Customer OTP Verified: ${d.proofNote}` : ''}
+                      </p>
+                    )}
                     {d.issueReport && <p className="mt-1 text-xs text-[var(--warn)]">Issue: {d.issueReport}</p>}
                   </div>
-                  <span className="text-xs uppercase font-medium text-[var(--accent)]">{d.step.replace(/_/g, ' ')}</span>
+                  <div className="flex flex-wrap items-center gap-3">
+                    {d.proofPhotoData && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setReceiptPreview({
+                            orderNumber: d.orderNumber,
+                            label: 'Rider Delivery Proof',
+                            code: d.proofNote ? `OTP Verified: ${d.proofNote}` : 'Delivery Proof Photo',
+                            image: d.proofPhotoData!,
+                          })
+                        }
+                        className="inline-flex items-center gap-2 rounded-full border border-[var(--champagne)] px-3.5 py-1.5 text-xs text-[var(--champagne)] cursor-pointer"
+                      >
+                        <img
+                          src={d.proofPhotoData}
+                          alt={`Delivery proof for ${d.orderNumber}`}
+                          className="h-5 w-5 rounded object-cover"
+                        />
+                        <span>View Delivery Photo</span>
+                      </button>
+                    )}
+                    <span className="text-xs uppercase font-medium text-[var(--accent)]">
+                      {d.step.replace(/_/g, ' ')}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
@@ -1102,84 +1229,255 @@ export function AdminPage() {
           )}
 
           {data && section === 'rbac' && (
-            <>
-              <div className="md:hidden space-y-3">
-                {data.users.map((u) => (
-                  <div key={u.uid} className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-4 space-y-3">
-                    <div className="min-w-0">
-                      <p className="font-medium text-sm truncate">{u.fullName || u.email}</p>
-                      <p className="text-xs text-[var(--muted)] truncate">{u.email}</p>
-                    </div>
-                    <div className="flex items-center justify-between gap-2">
-                      <select
-                        disabled={dbUser.role !== 'owneradmin'}
-                        value={u.role}
-                        onChange={(e) => void handleRoleChange(u.uid, e.target.value, u.isActive)}
-                        className="h-10 flex-1 rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-xs"
-                      >
-                        <option value="customer">customer</option>
-                        <option value="dispatch">dispatch</option>
-                        <option value="staff">staff</option>
-                        <option value="owneradmin">owneradmin</option>
-                      </select>
-                      <button
-                        type="button"
-                        disabled={dbUser.role !== 'owneradmin'}
-                        onClick={() => void handleRoleChange(u.uid, u.role, !u.isActive)}
-                        className="min-h-[40px] rounded-full border border-[var(--line-2)] px-4 py-1 text-xs cursor-pointer shrink-0"
-                      >
-                        {u.isActive ? 'Active' : 'Suspended'}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+            <div className="space-y-5">
+              {/* Role Filter Tabs & Add Driver/Staff Action */}
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-[var(--line)] pb-4">
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    { id: 'all' as const, label: 'All Users', count: usersDir?.counts.all },
+                    { id: 'dispatch' as const, label: 'Drivers', count: usersDir?.counts.dispatch },
+                    { id: 'staff' as const, label: 'Staff', count: usersDir?.counts.staff },
+                    { id: 'owneradmin' as const, label: 'Admins', count: usersDir?.counts.owneradmin },
+                    { id: 'customer' as const, label: 'Customers', count: usersDir?.counts.customer },
+                  ].map((tabItem) => (
+                    <button
+                      key={tabItem.id}
+                      type="button"
+                      onClick={() => {
+                        setUserRoleFilter(tabItem.id);
+                        setUserPage(1);
+                      }}
+                      className={`min-h-[38px] rounded-xl px-3.5 py-1.5 text-xs transition-colors cursor-pointer ${
+                        userRoleFilter === tabItem.id
+                          ? 'bg-[var(--accent)] text-[var(--accent-ink)] font-medium'
+                          : 'border border-[var(--line)] bg-[var(--surface)] text-[var(--soft)] hover:border-[var(--line-2)]'
+                      }`}
+                    >
+                      {tabItem.label}
+                      {tabItem.count !== undefined ? ` (${tabItem.count})` : ''}
+                    </button>
+                  ))}
+                </div>
+
+                {dbUser.role === 'owneradmin' && (
+                  <button
+                    type="button"
+                    onClick={() => setAddUserOpen(true)}
+                    className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-full bg-[var(--accent)] px-5 py-2 text-xs font-medium uppercase tracking-[0.1em] text-[var(--accent-ink)] cursor-pointer shrink-0"
+                  >
+                    <UserPlus className="h-3.5 w-3.5" />
+                    <span>Add Driver / Staff</span>
+                  </button>
+                )}
               </div>
 
-              <div className="hidden md:block rounded-2xl border border-[var(--line)] bg-[var(--surface)] overflow-x-auto">
-                <table className="w-full text-left text-sm">
-                  <thead className="border-b border-[var(--line)] text-xs uppercase text-[var(--muted)]">
-                    <tr>
-                      <th className="p-3.5">Account</th>
-                      <th className="p-3.5">Role</th>
-                      <th className="p-3.5">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[var(--line)]">
-                    {data.users.map((u) => (
-                      <tr key={u.uid}>
-                        <td className="p-3.5">
-                          <p className="font-medium">{u.fullName || u.email}</p>
-                          <p className="text-xs text-[var(--muted)]">{u.email}</p>
-                        </td>
-                        <td className="p-3.5">
-                          <select
-                            disabled={dbUser.role !== 'owneradmin'}
-                            value={u.role}
-                            onChange={(e) => void handleRoleChange(u.uid, e.target.value, u.isActive)}
-                            className="h-9 rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-2.5 text-xs"
-                          >
-                            <option value="customer">customer</option>
-                            <option value="dispatch">dispatch</option>
-                            <option value="staff">staff</option>
-                            <option value="owneradmin">owneradmin</option>
-                          </select>
-                        </td>
-                        <td className="p-3.5">
-                          <button
-                            type="button"
-                            disabled={dbUser.role !== 'owneradmin'}
-                            onClick={() => void handleRoleChange(u.uid, u.role, !u.isActive)}
-                            className="rounded-full border border-[var(--line-2)] px-3.5 py-1 text-xs cursor-pointer"
-                          >
-                            {u.isActive ? 'Active' : 'Suspended'}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+              {/* Search & Status Filter Toolbar */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  setUserSearchApplied(userSearchInput.trim());
+                  setUserPage(1);
+                }}
+                className="flex flex-col sm:flex-row gap-2.5"
+              >
+                <div className="relative flex-1">
+                  <Search className="h-4 w-4 text-[var(--muted)] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    value={userSearchInput}
+                    onChange={(e) => setUserSearchInput(e.target.value)}
+                    placeholder="Search by name, email, or phone..."
+                    className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--surface)] pl-10 pr-3 text-sm"
+                  />
+                </div>
+                <select
+                  aria-label="Filter by status"
+                  value={userStatusFilter}
+                  onChange={(e) => {
+                    setUserStatusFilter(e.target.value as 'all' | 'active' | 'suspended');
+                    setUserPage(1);
+                  }}
+                  className="h-10 rounded-xl border border-[var(--line-2)] bg-[var(--surface)] px-3 text-xs"
+                >
+                  <option value="all">All Status</option>
+                  <option value="active">Active Only</option>
+                  <option value="suspended">Suspended Only</option>
+                </select>
+                <button
+                  type="submit"
+                  className="h-10 rounded-xl border border-[var(--line-2)] bg-[var(--surface)] px-4 text-xs uppercase tracking-[0.08em] hover:border-[var(--accent)] cursor-pointer shrink-0"
+                >
+                  Search
+                </button>
+                {(userSearchApplied || userRoleFilter !== 'all' || userStatusFilter !== 'all') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUserSearchInput('');
+                      setUserSearchApplied('');
+                      setUserRoleFilter('all');
+                      setUserStatusFilter('all');
+                      setUserPage(1);
+                    }}
+                    className="h-10 rounded-xl border border-[var(--line)] px-3.5 text-xs text-[var(--muted)] hover:text-[var(--ink)] cursor-pointer shrink-0"
+                  >
+                    Reset
+                  </button>
+                )}
+              </form>
+
+              {/* Directory Content */}
+              {usersLoading ? (
+                <div className="h-48 rounded-2xl border border-[var(--line)] bg-[var(--surface)] animate-pulse" />
+              ) : (usersDir?.users || []).length === 0 ? (
+                <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-8 text-center text-sm text-[var(--muted)]">
+                  No accounts match your current search or filter.
+                </div>
+              ) : (
+                <>
+                  <div className="md:hidden space-y-3">
+                    {(usersDir?.users || []).map((u) => {
+                      const isSelf = u.uid === dbUser.uid;
+                      const isPending = u.uid.startsWith('pending-');
+                      return (
+                        <div key={u.uid} className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-4 space-y-3">
+                          <div className="min-w-0">
+                            <p className="font-medium text-sm truncate">
+                              {u.fullName || u.email}
+                              {isPending && (
+                                <span className="ml-2 text-[11px] font-normal text-[var(--champagne)]">
+                                  (Awaiting first sign-in)
+                                </span>
+                              )}
+                            </p>
+                            <p className="text-xs text-[var(--muted)] truncate">
+                              {u.email}
+                              {u.phone ? ` · ${u.phone}` : ''}
+                            </p>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <select
+                              disabled={dbUser.role !== 'owneradmin' || isSelf}
+                              value={u.role}
+                              onChange={(e) => void handleRoleChange(u.uid, e.target.value, u.isActive)}
+                              className="h-10 flex-1 rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-xs disabled:opacity-50"
+                            >
+                              <option value="customer">customer</option>
+                              <option value="dispatch">dispatch (driver)</option>
+                              <option value="staff">staff</option>
+                              <option value="owneradmin">owneradmin</option>
+                            </select>
+                            <button
+                              type="button"
+                              disabled={dbUser.role !== 'owneradmin' || isSelf}
+                              onClick={() => void handleRoleChange(u.uid, u.role, !u.isActive)}
+                              className="min-h-[40px] rounded-full border border-[var(--line-2)] px-4 py-1 text-xs cursor-pointer shrink-0 disabled:opacity-50"
+                            >
+                              {u.isActive ? 'Active' : 'Suspended'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="hidden md:block rounded-2xl border border-[var(--line)] bg-[var(--surface)] overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="border-b border-[var(--line)] text-xs uppercase text-[var(--muted)]">
+                        <tr>
+                          <th className="p-3.5">Account</th>
+                          <th className="p-3.5">Zone</th>
+                          <th className="p-3.5">Role</th>
+                          <th className="p-3.5">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[var(--line)]">
+                        {(usersDir?.users || []).map((u) => {
+                          const isSelf = u.uid === dbUser.uid;
+                          const isPending = u.uid.startsWith('pending-');
+                          return (
+                            <tr key={u.uid}>
+                              <td className="p-3.5">
+                                <p className="font-medium">
+                                  {u.fullName || u.email}
+                                  {isPending && (
+                                    <span className="ml-2 text-[11px] font-normal text-[var(--champagne)]">
+                                      (Awaiting first sign-in)
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-xs text-[var(--muted)]">
+                                  {u.email}
+                                  {u.phone ? ` · ${u.phone}` : ''}
+                                </p>
+                              </td>
+                              <td className="p-3.5 text-xs text-[var(--muted)]">
+                                {u.defaultZone || 'ph-gra'}
+                              </td>
+                              <td className="p-3.5">
+                                <select
+                                  disabled={dbUser.role !== 'owneradmin' || isSelf}
+                                  value={u.role}
+                                  onChange={(e) => void handleRoleChange(u.uid, e.target.value, u.isActive)}
+                                  className="h-9 rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-2.5 text-xs disabled:opacity-50"
+                                >
+                                  <option value="customer">customer</option>
+                                  <option value="dispatch">dispatch (driver)</option>
+                                  <option value="staff">staff</option>
+                                  <option value="owneradmin">owneradmin</option>
+                                </select>
+                              </td>
+                              <td className="p-3.5">
+                                <button
+                                  type="button"
+                                  disabled={dbUser.role !== 'owneradmin' || isSelf}
+                                  onClick={() => void handleRoleChange(u.uid, u.role, !u.isActive)}
+                                  className="rounded-full border border-[var(--line-2)] px-3.5 py-1 text-xs cursor-pointer disabled:opacity-50"
+                                >
+                                  {u.isActive ? 'Active' : 'Suspended'}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Pagination Footer */}
+                  {usersDir && usersDir.total > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1 text-xs text-[var(--muted)]">
+                      <span>
+                        Showing {(usersDir.page - 1) * usersDir.pageSize + 1}–
+                        {Math.min(usersDir.page * usersDir.pageSize, usersDir.total)} of {usersDir.total} users
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={usersDir.page <= 1}
+                          onClick={() => setUserPage((p) => Math.max(1, p - 1))}
+                          className="inline-flex h-9 items-center gap-1 rounded-xl border border-[var(--line-2)] bg-[var(--surface)] px-3 disabled:opacity-40 cursor-pointer"
+                        >
+                          <ChevronLeft className="h-3.5 w-3.5" />
+                          <span>Prev</span>
+                        </button>
+                        <span className="font-mono-num px-1">
+                          Page {usersDir.page} / {usersDir.totalPages}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={usersDir.page >= usersDir.totalPages}
+                          onClick={() => setUserPage((p) => Math.min(usersDir.totalPages, p + 1))}
+                          className="inline-flex h-9 items-center gap-1 rounded-xl border border-[var(--line-2)] bg-[var(--surface)] px-3 disabled:opacity-40 cursor-pointer"
+                        >
+                          <span>Next</span>
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           )}
 
           {settingsDraft && section === 'settings' && (
@@ -1283,9 +1581,10 @@ export function AdminPage() {
                       }
                       className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
                     >
-                      <option value="rider_confirm">Rider Confirmation</option>
-                      <option value="otp">Customer OTP Code</option>
-                      <option value="photo">Photo Proof Required</option>
+                      <option value="otp_photo">Customer OTP + Rider Photo (Both Required)</option>
+                      <option value="otp">Customer OTP Code Only</option>
+                      <option value="photo">Photo Proof Only</option>
+                      <option value="rider_confirm">Rider Confirmation Only</option>
                     </select>
                   </div>
                 </div>
@@ -1369,7 +1668,9 @@ export function AdminPage() {
             <div className="flex items-center justify-between gap-2 border-b border-[var(--line)] pb-3">
               <div className="min-w-0">
                 <p className="font-mono-num text-sm font-medium">{receiptPreview.orderNumber}</p>
-                <p className="text-xs text-[var(--muted)] truncate">Transaction Code: {receiptPreview.code}</p>
+                <p className="text-xs text-[var(--muted)] truncate">
+                  {receiptPreview.label || 'Transaction Code'}: {receiptPreview.code}
+                </p>
               </div>
               <button
                 type="button"
@@ -1382,11 +1683,109 @@ export function AdminPage() {
             <div className="flex-1 overflow-auto rounded-2xl border border-[var(--line)] bg-[var(--bg)] p-2">
               <img
                 src={receiptPreview.image}
-                alt={`Transfer receipt for ${receiptPreview.orderNumber}`}
+                alt={`${receiptPreview.label || 'Transfer receipt'} for ${receiptPreview.orderNumber}`}
                 className="w-full h-auto rounded-xl object-contain"
               />
             </div>
           </div>
+        </div>
+      )}
+      {addUserOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-4"
+          onClick={() => setAddUserOpen(false)}
+        >
+          <form
+            onSubmit={handleProvisionUser}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-3xl border border-[var(--line-2)] bg-[var(--surface)] p-5 sm:p-6 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2 border-b border-[var(--line)] pb-3">
+              <div>
+                <h2 className="font-display text-2xl">Add Driver or Team Member</h2>
+                <p className="text-xs text-[var(--muted)]">
+                  Pre-authorize an email; role activates when they sign up or sign in on the Account page.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAddUserOpen(false)}
+                className="min-h-[36px] shrink-0 rounded-full border border-[var(--line-2)] px-3.5 text-xs uppercase cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs text-[var(--muted)] mb-1">Full Name</label>
+              <input
+                required
+                value={newUserName}
+                onChange={(e) => setNewUserName(e.target.value)}
+                placeholder="e.g. Tunde Balogun"
+                className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-[var(--muted)] mb-1">Email Address</label>
+              <input
+                required
+                type="email"
+                value={newUserEmail}
+                onChange={(e) => setNewUserEmail(e.target.value)}
+                placeholder="driver@rawhairs.ng"
+                className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
+              />
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="block text-xs text-[var(--muted)] mb-1">Phone (Optional)</label>
+                <input
+                  value={newUserPhone}
+                  onChange={(e) => setNewUserPhone(e.target.value)}
+                  placeholder="+23480..."
+                  className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[var(--muted)] mb-1">Role</label>
+                <select
+                  value={newUserRole}
+                  onChange={(e) => setNewUserRole(e.target.value as 'dispatch' | 'staff' | 'customer')}
+                  className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
+                >
+                  <option value="dispatch">Dispatch Rider</option>
+                  <option value="staff">Operations Staff</option>
+                  <option value="customer">Customer</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs text-[var(--muted)] mb-1">Primary Rivers Zone</label>
+              <select
+                value={newUserZone}
+                onChange={(e) => setNewUserZone(e.target.value)}
+                className="h-10 w-full rounded-xl border border-[var(--line-2)] bg-[var(--bg)] px-3 text-sm"
+              >
+                {(data?.settings.riversZones || []).map((z) => (
+                  <option key={z.id} value={z.id}>
+                    {z.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <button
+              type="submit"
+              disabled={addingUser}
+              className="w-full min-h-[44px] rounded-full bg-[var(--accent)] py-3 text-xs font-medium uppercase tracking-[0.12em] text-[var(--accent-ink)] disabled:opacity-50 cursor-pointer"
+            >
+              {addingUser ? 'Adding...' : 'Authorize & Save'}
+            </button>
+          </form>
         </div>
       )}
     </div>

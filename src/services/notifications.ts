@@ -14,7 +14,8 @@ export type NotificationEventType =
   | 'booking.updated'
   | 'return.submitted'
   | 'quotation.requested'
-  | 'quotation.quoted';
+  | 'quotation.quoted'
+  | 'team.invited';
 
 export interface DispatchNotificationInput {
   eventType: NotificationEventType;
@@ -52,6 +53,7 @@ function formatDefaultSubject(eventType: NotificationEventType, entityId: string
     'return.submitted': `Return Request Received · ${entityId}`,
     'quotation.requested': `International Quote Request · ${entityId}`,
     'quotation.quoted': `International Quotation Ready · ${entityId}`,
+    'team.invited': `Operations Access Ready · ${entityId}`,
   };
   return `Raw.hairs — ${labels[eventType] || entityId}`;
 }

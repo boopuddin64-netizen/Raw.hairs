@@ -16,6 +16,8 @@ interface TrackedOrder {
     paymentStatus: string;
     bankTransactionCode?: string | null;
     hasReceipt?: boolean;
+    deliveryOtp?: string | null;
+    deliveryProofMode?: string | null;
     status: string;
     createdAt: string;
   };
@@ -133,6 +135,22 @@ export function TrackOrderPage() {
               </span>
               <span className="uppercase font-medium" style={{ color: result.order.paymentStatus === 'paid' ? 'var(--ok)' : 'var(--champagne)' }}>
                 {result.order.paymentStatus === 'paid' ? 'Confirmed by Admin' : 'Awaiting Admin Confirmation'}
+              </span>
+            </div>
+          )}
+
+          {result.order.deliveryOtp && result.order.status !== 'delivered' && (
+            <div className="rounded-2xl border border-[var(--accent)]/50 bg-[var(--surface-2)] p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.16em] text-[var(--accent)] font-medium">
+                  Customer Delivery OTP
+                </p>
+                <p className="mt-1 text-xs text-[var(--muted)]">
+                  Share this 6-digit code with your Raw.hairs rider only when receiving your order (alongside rider delivery photo proof).
+                </p>
+              </div>
+              <span className="font-mono-num text-2xl sm:text-3xl font-semibold tracking-[0.22em] text-[var(--ink)] shrink-0">
+                {result.order.deliveryOtp}
               </span>
             </div>
           )}

@@ -44,7 +44,12 @@
             var r = e.reason;
             var stack = r && typeof r.stack === 'string' ? r.stack : '';
             var msg = r && typeof r.message === 'string' ? r.message : String(r || '');
-            if (isExt(stack) || msg.indexOf('MetaMask') !== -1) {
+            if (
+              isExt(stack) ||
+              msg.indexOf('MetaMask') !== -1 ||
+              stack.indexOf('@vite/client') !== -1 ||
+              msg.indexOf('WebSocket closed without opened.') !== -1
+            ) {
               e.preventDefault();
               e.stopImmediatePropagation();
             }

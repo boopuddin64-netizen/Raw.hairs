@@ -25,7 +25,12 @@ window.addEventListener(
   (event) => {
     const stack = typeof event.reason?.stack === 'string' ? event.reason.stack : '';
     const msg = typeof event.reason?.message === 'string' ? event.reason.message : '';
-    if (stack.includes('chrome-extension://') || msg.includes('MetaMask')) {
+    if (
+      stack.includes('chrome-extension://') ||
+      msg.includes('MetaMask') ||
+      stack.includes('@vite/client') ||
+      msg.includes('WebSocket closed without opened.')
+    ) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }

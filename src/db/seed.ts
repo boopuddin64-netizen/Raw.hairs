@@ -97,7 +97,7 @@ async function runSeed() {
         bankAccountName: 'Raw.hairs Studio Port Harcourt',
         bankTransferInstructions:
           'Transfer the exact total using your RH order number as narration, then enter your transaction/session code and upload your receipt for Admin confirmation.',
-        deliveryProofMode: 'rider_confirm',
+        deliveryProofMode: 'otp_photo',
         returnWindowHours: 48,
         returnEligibilityNotes:
           'Returns are accepted within 48 hours of confirmed delivery for unworn, unwashed hair and unused sealed tools/care items with original Raw.hairs packaging intact. Photographic evidence is required.',
@@ -132,6 +132,7 @@ async function runSeed() {
           defaultState: 'Rivers',
           defaultZone: 'ph-gra',
           defaultAddress: 'Port Harcourt Dispatch Hub, Rivers State',
+          isActive: false,
         },
         {
           uid: 'rider-ph-02',
